@@ -139,7 +139,8 @@ function shouldAskForAcademicClarification(
 
 function previousUserQuestion(history: Msg[]): string {
   for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i]?.role === "user") return history[i].text;
+    const turn = history[i];
+    if (turn?.role === "user") return turn.text;
   }
   return "";
 }
@@ -322,24 +323,74 @@ async function searchRvrjcPdfs(question: string) {
       .replace(/\s+/g, " ")
       .trim();
 
-    const res = await fetch(
-      "https://kalki11.app.n8n.cloud/webhook/8c33de64-2912-4149-8578-604ffe513622",
-      {
+    // Backend Mode Switch:
+    // RIVA mode (default) strictly requires both RIVA_BACKEND_URL and RIVA_BACKEND_API_KEY.
+    // Fails closed (returns []) if either is missing to prevent unauthenticated/unprotected traffic.
+    // Legacy cloud mode is preserved ONLY if explicitly enabled via RIVA_BACKEND_MODE="legacy" or RIVA_USE_LEGACY_BACKEND="true".
+    const isLegacyMode =
+      process.env["RIVA_BACKEND_MODE"] === "legacy" ||
+      process.env["RIVA_USE_LEGACY_BACKEND"] === "true";
+
+    let targetUrl: string;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    if (isLegacyMode) {
+      targetUrl =
+        process.env["RIVA_LEGACY_URL"] ||
+        "https://kalki11.app.n8n.cloud/webhook/8c33de64-2912-4149-8578-604ffe513622";
+    } else {
+      const backendUrl = process.env["RIVA_BACKEND_URL"]?.trim();
+      const apiKey = process.env["RIVA_BACKEND_API_KEY"]?.trim();
+
+      // Fail-closed in RIVA mode if either required credential is missing
+      if (!backendUrl || !apiKey) {
+        return [];
+      }
+
+      headers["X-RIVA-API-KEY"] = apiKey;
+
+      targetUrl = backendUrl.replace(/\/+$/, "");
+      if (!targetUrl.includes("/webhook/") && !targetUrl.includes("/webhook-test/")) {
+        targetUrl = `${targetUrl}/webhook/riva-local-live-test`;
+      }
+    }
+
+    // Timeout Clamping: approved range is 1,000ms to 55,000ms (default: 25,000ms)
+    const rawTimeout = process.env["RIVA_TIMEOUT_MS"];
+    let timeoutMs = rawTimeout ? parseInt(rawTimeout, 10) : 25000;
+    if (isNaN(timeoutMs) || timeoutMs < 1000) {
+      timeoutMs = 25000;
+    } else if (timeoutMs > 55000) {
+      timeoutMs = 55000;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const res = await fetch(targetUrl, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers,
         body: JSON.stringify({
           query: searchQuery || question,
         }),
-      },
-    );
+        signal: controller.signal,
+      });
 
-    if (!res.ok) return [];
+      if (!res.ok) return [];
 
-    const data = await res.json();
+      const data = await res.json();
 
-    return Array.isArray(data) ? data : [];
+      return Array.isArray(data)
+        ? data
+        : data && typeof data === "object"
+          ? [data]
+          : [];
+    } finally {
+      clearTimeout(timer);
+    }
   } catch {
     return [];
   }
